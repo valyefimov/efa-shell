@@ -115,6 +115,13 @@ Every non-empty command is recorded, including built-in `cd` (kept because
 directory-navigation history is likely useful for future navigation
 features).
 
+Built-in `cd` also syncs the real OS process directory
+(`std::env::set_current_dir`), not just efa's own tracked `cwd`. This
+matters because reedline's hinter and `EfaCompleter` fall back to
+`std::env::current_dir()` for their directory context; without the sync,
+suggestions would keep looking at whatever directory efa was *launched*
+from instead of wherever you've since `cd`-ed to.
+
 Reedline's own `Up`/`Down` history (a separate, plain-text file at
 `~/.efa/line_history.txt`) is used only to drive normal up/down recall in
 the line editor; SQLite remains the single source of truth for
@@ -132,7 +139,9 @@ directory-aware suggestions and ranking.
   (no `cd -`, no `CDPATH`, etc.).
 - `gh` completion is a static command/subcommand table only — no live
   data (no open PRs, no issue titles, no repo-specific info).
-- No AI-based or general filesystem-path completion yet.
+- Filesystem-path completion covers `cd` only; other commands taking a
+  file/directory argument (`cat`, `code`, `rm`, ...) don't get it yet.
+- No AI-based suggestions yet.
 - No Homebrew formula; install by copying/symlinking the binary.
 
 ## Development roadmap

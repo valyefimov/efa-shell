@@ -77,6 +77,15 @@ impl Shell {
         match target {
             Some(path) => match path.canonicalize() {
                 Ok(canon) => {
+                    // Keep the real process cwd in sync with our tracked one:
+                    // reedline's hinter (and EfaCompleter) fall back to
+                    // `std::env::current_dir()` whenever no explicit cwd is
+                    // configured, so without this, suggestions would keep
+                    // looking at the directory efa was launched from instead
+                    // of wherever the user has since `cd`-ed to.
+                    if let Err(e) = env::set_current_dir(&canon) {
+                        eprintln!("cd: {}: {}", canon.display(), e);
+                    }
                     self.cwd = canon;
                     CommandOutcome::ChangedDirectory
                 }
