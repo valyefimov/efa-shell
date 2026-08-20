@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nu_ansi_term::{Color, Style};
@@ -33,16 +33,67 @@ fn split_current(text: &str) -> (Vec<&str>, &str) {
     }
 }
 
+/// Split a path-ish token into the directory to list and the filename
+/// prefix to match within it. `"sub/di"` -> (dir `sub/`, prefix `"di"`); a
+/// prefix with no `/` lists `cwd` itself.
+fn resolve_prefix_dir(cwd: &Path, prefix: &str) -> (PathBuf, String, String) {
+    match prefix.rfind('/') {
+        Some(idx) => {
+            let dir_part = &prefix[..=idx];
+            let file_part = &prefix[idx + 1..];
+            let resolved_dir = if let Some(rest) = dir_part.strip_prefix('/') {
+                PathBuf::from("/").join(rest)
+            } else if let Some(rest) = dir_part.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| cwd.join(dir_part))
+            } else {
+                cwd.join(dir_part)
+            };
+            (resolved_dir, dir_part.to_string(), file_part.to_string())
+        }
+        None => (cwd.to_path_buf(), String::new(), prefix.to_string()),
+    }
+}
+
+/// Directory-name candidates for `cd <partial-path>`, read straight off the
+/// filesystem. Hidden entries (dotfiles) are only offered once the user has
+/// started typing a `.`, matching typical shell completion behavior.
+fn fs_dir_candidates(cwd: &Path, prefix: &str) -> Vec<String> {
+    let (dir, display_prefix, file_prefix) = resolve_prefix_dir(cwd, prefix);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && !file_prefix.starts_with('.') {
+            continue;
+        }
+        if name.starts_with(&file_prefix) {
+            out.push(format!("{display_prefix}{name}/"));
+        }
+    }
+    out
+}
+
 /// Candidates for the token currently being typed, based on git/gh/package-
-/// manager knowledge only (no history). Each candidate is the *completed
-/// final token* (e.g. `"checkout"`, a branch name, a script name) - not a
-/// full command line.
+/// manager/filesystem knowledge only (no history). Each candidate is the
+/// *completed final token* (e.g. `"checkout"`, a branch name, a script
+/// name, a directory name) - not a full command line.
 ///
 /// Priority order, first match wins (mirrors the plan's fallback chain):
 /// 1. `git <partial-subcommand>`
 /// 2. `git (checkout|switch|merge|rebase) <partial-branch>` (git repo only)
 /// 3. `gh <partial-command>` / `gh <known-command> <partial-subcommand>`
 /// 4. `(pnpm|npm|yarn)( run)? <partial-script-or-subcommand>`
+/// 5. `cd <partial-path>` - directory names from the filesystem
 fn fallback_last_token_candidates(
     toks: &[&str],
     prefix: &str,
@@ -50,6 +101,7 @@ fn fallback_last_token_candidates(
     branches: &[String],
     current_branch: Option<&str>,
     package_scripts: &[String],
+    cwd: &Path,
 ) -> Vec<String> {
     match toks {
         ["git"] => git::matching_subcommands(prefix)
@@ -90,6 +142,7 @@ fn fallback_last_token_candidates(
             .filter(|s| s.starts_with(prefix))
             .cloned()
             .collect(),
+        ["cd"] => fs_dir_candidates(cwd, prefix),
         _ => Vec::new(),
     }
 }
@@ -105,6 +158,7 @@ pub fn resolve_inline_hint(
     branches: &[String],
     current_branch: Option<&str>,
     package_scripts: &[String],
+    cwd: &Path,
 ) -> Option<String> {
     if let Some(command) = history_match {
         let rest = command.strip_prefix(line)?;
@@ -121,6 +175,7 @@ pub fn resolve_inline_hint(
         branches,
         current_branch,
         package_scripts,
+        cwd,
     );
     candidates.sort();
     candidates.into_iter().next().map(|candidate| {
@@ -193,6 +248,7 @@ impl Hinter for EfaHinter {
                 &branches,
                 current_branch.as_deref(),
                 &package_scripts,
+                &PathBuf::from(cwd),
             )
             .unwrap_or_default()
         } else {
@@ -284,14 +340,19 @@ impl Completer for EfaCompleter {
             &branches,
             current_branch.as_deref(),
             &package_scripts,
+            &cwd,
         );
         fallback_candidates.sort();
         fallback_candidates.dedup();
         for candidate in fallback_candidates {
+            // Directory candidates end in `/`: leave the cursor right after
+            // it so the user can keep drilling into the path, rather than
+            // inserting a trailing space.
+            let append_whitespace = !candidate.ends_with('/');
             suggestions.push(ReedlineSuggestion {
                 value: candidate,
                 span: Span::new(prefix_start, pos),
-                append_whitespace: true,
+                append_whitespace,
                 ..Default::default()
             });
         }
@@ -315,32 +376,73 @@ mod tests {
             &branches,
             None,
             &[],
+            Path::new("/nonexistent"),
         );
         assert_eq!(hint, Some("eckout-history".to_string()));
     }
 
     #[test]
     fn git_fallback_activates_only_on_history_miss() {
-        let hint = resolve_inline_hint("git chec", None, true, &[], None, &[]);
+        let hint = resolve_inline_hint(
+            "git chec",
+            None,
+            true,
+            &[],
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("kout".to_string()));
     }
 
     #[test]
     fn git_branch_fallback_requires_git_repo() {
         let branches = vec!["main".to_string(), "feature/foo".to_string()];
-        let hint = resolve_inline_hint("git checkout ma", None, false, &branches, None, &[]);
+        let hint = resolve_inline_hint(
+            "git checkout ma",
+            None,
+            false,
+            &branches,
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, None);
 
-        let hint = resolve_inline_hint("git checkout ma", None, true, &branches, None, &[]);
+        let hint = resolve_inline_hint(
+            "git checkout ma",
+            None,
+            true,
+            &branches,
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("in".to_string()));
     }
 
     #[test]
     fn gh_fallback() {
-        let hint = resolve_inline_hint("gh p", None, false, &[], None, &[]);
+        let hint = resolve_inline_hint(
+            "gh p",
+            None,
+            false,
+            &[],
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("r".to_string()));
 
-        let hint = resolve_inline_hint("gh pr cre", None, false, &[], None, &[]);
+        let hint = resolve_inline_hint(
+            "gh pr cre",
+            None,
+            false,
+            &[],
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("ate".to_string()));
     }
 
@@ -348,27 +450,59 @@ mod tests {
     fn pkgmgr_scripts_win_over_subcommands() {
         let scripts = vec!["devserver".to_string()];
         // "dev" only matches the script, not any static pnpm subcommand.
-        let hint = resolve_inline_hint("pnpm dev", None, false, &[], None, &scripts);
+        let hint = resolve_inline_hint(
+            "pnpm dev",
+            None,
+            false,
+            &[],
+            None,
+            &scripts,
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("server".to_string()));
     }
 
     #[test]
     fn pkgmgr_run_form_only_offers_scripts() {
         let scripts = vec!["build".to_string()];
-        let hint = resolve_inline_hint("pnpm run bui", None, false, &[], None, &scripts);
+        let hint = resolve_inline_hint(
+            "pnpm run bui",
+            None,
+            false,
+            &[],
+            None,
+            &scripts,
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("ld".to_string()));
     }
 
     #[test]
     fn current_branch_excluded_from_checkout_candidates() {
         let branches = vec!["main".to_string(), "master".to_string()];
-        let hint = resolve_inline_hint("git checkout ma", None, true, &branches, Some("main"), &[]);
+        let hint = resolve_inline_hint(
+            "git checkout ma",
+            None,
+            true,
+            &branches,
+            Some("main"),
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, Some("ster".to_string()));
     }
 
     #[test]
     fn no_fallback_when_nothing_matches() {
-        let hint = resolve_inline_hint("echo hel", None, true, &["main".to_string()], None, &[]);
+        let hint = resolve_inline_hint(
+            "echo hel",
+            None,
+            true,
+            &["main".to_string()],
+            None,
+            &[],
+            Path::new("/nonexistent"),
+        );
         assert_eq!(hint, None);
     }
 
@@ -376,5 +510,72 @@ mod tests {
     fn split_current_trailing_whitespace_means_empty_prefix() {
         assert_eq!(split_current("git "), (vec!["git"], ""));
         assert_eq!(split_current("git chec"), (vec!["git"], "chec"));
+    }
+
+    fn tempdir() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "efa-completion-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn cd_completes_directory_names() {
+        let root = tempdir();
+        std::fs::create_dir_all(root.join("vaeproject")).unwrap();
+        std::fs::create_dir_all(root.join("vaeother")).unwrap();
+        std::fs::write(root.join("vaefile.txt"), "").unwrap();
+
+        let hint = resolve_inline_hint("cd vae", None, false, &[], None, &[], &root);
+        // Both "vaeproject/" and "vaeother/" match; alphabetical sort picks
+        // "vaeother/" first, and files are never offered for `cd`.
+        assert_eq!(hint, Some("other/".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cd_completes_nested_path() {
+        let root = tempdir();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+
+        let hint = resolve_inline_hint("cd sub/de", None, false, &[], None, &[], &root);
+        assert_eq!(hint, Some("ep/".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cd_hides_dotfiles_unless_typed() {
+        let root = tempdir();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join("visible")).unwrap();
+
+        assert_eq!(
+            resolve_inline_hint("cd ", None, false, &[], None, &[], &root),
+            Some("visible/".to_string())
+        );
+        assert_eq!(
+            resolve_inline_hint("cd .", None, false, &[], None, &[], &root),
+            Some("hidden/".to_string())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cd_no_match_returns_none() {
+        let root = tempdir();
+        let hint = resolve_inline_hint("cd zzz", None, false, &[], None, &[], &root);
+        assert_eq!(hint, None);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

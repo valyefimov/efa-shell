@@ -17,10 +17,10 @@ efa shows an inline autosuggestion for `pnpm dev`, with the already-typed
 `pn` rendered normally and the remaining `pm dev` dimmed. Press `Tab` or
 `Right Arrow` (at the end of the line) to accept it, then `Enter` to run it.
 
-efa also knows about git, `gh`, and pnpm/npm/yarn even when you haven't run
-a matching command before. If there's no inline hint to accept, `Tab` opens
-a fish-style completion menu instead - cycle forward with `Tab`, backward
-with `Shift+Tab`:
+efa also knows about git, `gh`, pnpm/npm/yarn, and `cd` directory paths even
+when you haven't run a matching command before. If there's no inline hint
+to accept, `Tab` opens a fish-style completion menu instead - cycle forward
+with `Tab`, backward with `Shift+Tab`:
 
 ```
 ~/projects/payslick ❯ git checkout <Tab>
@@ -43,6 +43,9 @@ On top of that (v0.2):
   auth).
 - pnpm/npm/yarn subcommand and `package.json` script completion (from the
   nearest `package.json`, project-root-aware).
+- `cd <partial-path>` directory-name completion, read straight from the
+  filesystem (relative, absolute, and `~/`-prefixed paths; hidden
+  directories only offered once you've typed a leading `.`).
 - A real fish-style Tab-cycled completion menu, in addition to the single
   dimmed inline hint.
 
