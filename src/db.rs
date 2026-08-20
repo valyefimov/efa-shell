@@ -69,13 +69,14 @@ impl Db {
         &self,
         command: &str,
         cwd: &str,
+        project_root: Option<&str>,
         exit_code: Option<i32>,
         executed_at: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
-            "INSERT INTO command_history (command, cwd, exit_code, executed_at) VALUES (?1, ?2, ?3, ?4)",
-            (command, cwd, exit_code, executed_at),
+            "INSERT INTO command_history (command, cwd, project_root, exit_code, executed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (command, cwd, project_root, exit_code, executed_at),
         )?;
         Ok(())
     }
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn insertion_and_prefix_search() {
         let db = mem_db();
-        db.record("pnpm dev", "/proj", Some(0), 1).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 1).unwrap();
         let hit = db.best_suggestion("/proj", "pn").unwrap();
         assert_eq!(hit.unwrap().command, "pnpm dev");
     }
@@ -161,7 +162,8 @@ mod tests {
     #[test]
     fn directory_isolation() {
         let db = mem_db();
-        db.record("pnpm start", "/proj/other", Some(0), 1).unwrap();
+        db.record("pnpm start", "/proj/other", None, Some(0), 1)
+            .unwrap();
         let hit = db.best_suggestion("/proj/payslick", "pn").unwrap();
         assert!(hit.is_none());
     }
@@ -169,9 +171,9 @@ mod tests {
     #[test]
     fn frequency_ranking() {
         let db = mem_db();
-        db.record("pnpm test", "/proj", Some(0), 1).unwrap();
-        db.record("pnpm dev", "/proj", Some(0), 2).unwrap();
-        db.record("pnpm dev", "/proj", Some(0), 3).unwrap();
+        db.record("pnpm test", "/proj", None, Some(0), 1).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 2).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 3).unwrap();
         let hit = db.best_suggestion("/proj", "pn").unwrap().unwrap();
         assert_eq!(hit.command, "pnpm dev");
         assert_eq!(hit.usage_count, 2);
@@ -180,8 +182,8 @@ mod tests {
     #[test]
     fn recency_tie_break() {
         let db = mem_db();
-        db.record("pnpm dev", "/proj", Some(0), 10).unwrap();
-        db.record("pnpm test", "/proj", Some(0), 20).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 10).unwrap();
+        db.record("pnpm test", "/proj", None, Some(0), 20).unwrap();
         let hit = db.best_suggestion("/proj", "pn").unwrap().unwrap();
         assert_eq!(hit.command, "pnpm test");
     }
@@ -195,14 +197,14 @@ mod tests {
     #[test]
     fn empty_prefix_returns_none() {
         let db = mem_db();
-        db.record("pnpm dev", "/proj", Some(0), 1).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 1).unwrap();
         assert!(db.best_suggestion("/proj", "").unwrap().is_none());
     }
 
     #[test]
     fn special_characters_in_commands() {
         let db = mem_db();
-        db.record("cat package.json | grep scripts", "/proj", Some(0), 1)
+        db.record("cat package.json | grep scripts", "/proj", None, Some(0), 1)
             .unwrap();
         let hit = db.best_suggestion("/proj", "cat pack").unwrap().unwrap();
         assert_eq!(hit.command, "cat package.json | grep scripts");
@@ -211,8 +213,8 @@ mod tests {
     #[test]
     fn like_wildcards_in_prefix_are_escaped() {
         let db = mem_db();
-        db.record("echo 100%", "/proj", Some(0), 1).unwrap();
-        db.record("echo xyz", "/proj", Some(0), 2).unwrap();
+        db.record("echo 100%", "/proj", None, Some(0), 1).unwrap();
+        db.record("echo xyz", "/proj", None, Some(0), 2).unwrap();
         // A literal '%' in the prefix must not act as a wildcard.
         let hit = db.best_suggestion("/proj", "echo 100%").unwrap().unwrap();
         assert_eq!(hit.command, "echo 100%");
@@ -222,7 +224,7 @@ mod tests {
     fn paths_with_spaces() {
         let db = mem_db();
         let cwd = "/Users/me/My Projects/payslick";
-        db.record("pnpm dev", cwd, Some(0), 1).unwrap();
+        db.record("pnpm dev", cwd, None, Some(0), 1).unwrap();
         let hit = db.best_suggestion(cwd, "pn").unwrap().unwrap();
         assert_eq!(hit.command, "pnpm dev");
     }
@@ -230,11 +232,27 @@ mod tests {
     #[test]
     fn top_suggestions_multiple_matches() {
         let db = mem_db();
-        db.record("pnpm dev", "/proj", Some(0), 1).unwrap();
-        db.record("pnpm dev", "/proj", Some(0), 2).unwrap();
-        db.record("pnpm test", "/proj", Some(0), 3).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 1).unwrap();
+        db.record("pnpm dev", "/proj", None, Some(0), 2).unwrap();
+        db.record("pnpm test", "/proj", None, Some(0), 3).unwrap();
         let hits = db.top_suggestions("/proj", "pn", 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].command, "pnpm dev");
+    }
+
+    #[test]
+    fn project_root_is_stored() {
+        let db = mem_db();
+        db.record("pnpm dev", "/proj", Some("/proj"), Some(0), 1)
+            .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT project_root FROM command_history WHERE command = 'pnpm dev'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, Some("/proj".to_string()));
     }
 }

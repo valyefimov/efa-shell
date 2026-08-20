@@ -19,12 +19,19 @@ impl History {
         History { db }
     }
 
-    pub fn record(&self, command: &str, cwd: &str, exit_code: Option<i32>) -> Result<()> {
+    pub fn record(
+        &self,
+        command: &str,
+        cwd: &str,
+        project_root: Option<&str>,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
         if command.trim().is_empty() {
             return Ok(());
         }
         let executed_at = now_unix();
-        self.db.record(command, cwd, exit_code, executed_at)
+        self.db
+            .record(command, cwd, project_root, exit_code, executed_at)
     }
 }
 

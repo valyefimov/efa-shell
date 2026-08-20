@@ -1,19 +1,27 @@
 mod completion;
 mod db;
+mod gh;
+mod git;
 mod history;
+mod pkgmgr;
+mod project;
 mod shell;
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use anyhow::Result;
 use reedline::{
-    Emacs, FileBackedHistory, KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch,
-    Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
+    ColumnarMenu, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder, Prompt,
+    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    default_emacs_keybindings,
 };
 
-use completion::EfaHinter;
+use completion::{EfaCompleter, EfaHinter};
 use db::Db;
+use git::BranchCache;
 use history::History;
+use project::ProjectDetector;
 use shell::{CommandOutcome, Shell};
 
 /// Minimal prompt: `<cwd> ❯ `, updated every iteration to track `cd`.
@@ -73,23 +81,45 @@ fn main() -> Result<()> {
 
     let db = Db::open_default()?;
     let history = History::new(db.clone());
+    let project = Arc::new(ProjectDetector::new());
+    let branch_cache = Arc::new(BranchCache::new());
 
     let line_history = Box::new(FileBackedHistory::with_file(1000, history_file_path()?)?);
-    let hinter = Box::new(EfaHinter::new(db));
+    let hinter = Box::new(EfaHinter::new(
+        db.clone(),
+        project.clone(),
+        branch_cache.clone(),
+    ));
+    let completer = Box::new(EfaCompleter::new(db, project.clone(), branch_cache));
+    let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
+        ColumnarMenu::default().with_name("completion_menu"),
+    ));
 
     let mut keybindings = default_emacs_keybindings();
-    // Right Arrow and the default HistoryHintComplete binding already accept
-    // the hint at end-of-line; Tab is not bound by default, so wire it up
-    // to the same event.
+    // First Tab press either accepts the inline hint (if one exists) or
+    // opens the completion menu; once the menu is open, further Tab presses
+    // cycle forward and Shift+Tab cycles backward, matching fish's
+    // Tab/Shift+Tab pager navigation.
     keybindings.add_binding(
         KeyModifiers::NONE,
         KeyCode::Tab,
-        ReedlineEvent::HistoryHintComplete,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::HistoryHintComplete,
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::MenuPrevious,
     );
     let edit_mode = Box::new(Emacs::new(keybindings));
 
     let mut line_editor = Reedline::create()
         .with_hinter(hinter)
+        .with_completer(completer)
+        .with_menu(completion_menu)
         .with_history(line_history)
         .with_edit_mode(edit_mode);
 
@@ -120,7 +150,11 @@ fn main() -> Result<()> {
                         None
                     }
                 };
-                if let Err(e) = history.record(trimmed, &cwd, exit_code) {
+                let project_root = project
+                    .detect(shell.cwd())
+                    .primary()
+                    .map(|p| p.display().to_string());
+                if let Err(e) = history.record(trimmed, &cwd, project_root.as_deref(), exit_code) {
                     eprintln!("efa: failed to record history: {}", e);
                 }
             }
