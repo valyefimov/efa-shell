@@ -56,10 +56,11 @@ fn resolve_prefix_dir(cwd: &Path, prefix: &str) -> (PathBuf, String, String) {
     }
 }
 
-/// Directory-name candidates for `cd <partial-path>`, read straight off the
-/// filesystem. Hidden entries (dotfiles) are only offered once the user has
-/// started typing a `.`, matching typical shell completion behavior.
-fn fs_dir_candidates(cwd: &Path, prefix: &str) -> Vec<String> {
+/// Filesystem-entry candidates for a `<partial-path>` argument. Directory
+/// names get a trailing `/` so completion can keep drilling in; hidden
+/// entries (dotfiles) are only offered once the user has started typing a
+/// `.`, matching typical shell completion behavior.
+fn fs_path_candidates(cwd: &Path, prefix: &str, dirs_only: bool) -> Vec<String> {
     let (dir, display_prefix, file_prefix) = resolve_prefix_dir(cwd, prefix);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -69,7 +70,8 @@ fn fs_dir_candidates(cwd: &Path, prefix: &str) -> Vec<String> {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_dir() {
+        let is_dir = file_type.is_dir();
+        if dirs_only && !is_dir {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
@@ -77,7 +79,8 @@ fn fs_dir_candidates(cwd: &Path, prefix: &str) -> Vec<String> {
             continue;
         }
         if name.starts_with(&file_prefix) {
-            out.push(format!("{display_prefix}{name}/"));
+            let suffix = if is_dir { "/" } else { "" };
+            out.push(format!("{display_prefix}{name}{suffix}"));
         }
     }
     out
@@ -90,16 +93,24 @@ fn fs_dir_candidates(cwd: &Path, prefix: &str) -> Vec<String> {
 ///
 /// Priority order, first match wins (mirrors the plan's fallback chain):
 /// 1. `git <partial-subcommand>`
-/// 2. `git (checkout|switch|merge|rebase) <partial-branch>` (git repo only)
-/// 3. `gh <partial-command>` / `gh <known-command> <partial-subcommand>`
-/// 4. `(pnpm|npm|yarn)( run)? <partial-script-or-subcommand>`
-/// 5. `cd <partial-path>` - directory names from the filesystem
+/// 2. `git (checkout|switch|merge|rebase) <partial-branch>` (git repo only,
+///    current branch excluded)
+/// 3. `git (diff|log|show) <partial-branch>` (git repo only, current branch
+///    included)
+/// 4. `git (add|restore|rm|mv) <partial-path>` - files and directories
+/// 5. `git (push|pull|fetch) <partial-remote>`, then
+///    `git (push|pull|fetch) <remote> <partial-branch>`
+/// 6. `gh <partial-command>` / `gh <known-command> <partial-subcommand>`
+/// 7. `(pnpm|npm|yarn)( run)? <partial-script-or-subcommand>`
+/// 8. `cd <partial-path>` - directory names from the filesystem
+#[allow(clippy::too_many_arguments)]
 fn fallback_last_token_candidates(
     toks: &[&str],
     prefix: &str,
     in_git_repo: bool,
     branches: &[String],
     current_branch: Option<&str>,
+    remotes: &[String],
     package_scripts: &[String],
     cwd: &Path,
 ) -> Vec<String> {
@@ -114,6 +125,26 @@ fn fallback_last_token_candidates(
             .filter(|b| b.starts_with(prefix) && Some(b.as_str()) != current_branch)
             .cloned()
             .collect(),
+        ["git", sub] if in_git_repo && git::REF_TAKING_SUBCOMMANDS.contains(sub) => branches
+            .iter()
+            .filter(|b| b.starts_with(prefix))
+            .cloned()
+            .collect(),
+        ["git", sub] if git::PATH_TAKING_SUBCOMMANDS.contains(sub) => {
+            fs_path_candidates(cwd, prefix, false)
+        }
+        ["git", sub] if in_git_repo && git::REMOTE_TAKING_SUBCOMMANDS.contains(sub) => remotes
+            .iter()
+            .filter(|r| r.starts_with(prefix))
+            .cloned()
+            .collect(),
+        ["git", sub, _remote] if in_git_repo && git::REMOTE_TAKING_SUBCOMMANDS.contains(sub) => {
+            branches
+                .iter()
+                .filter(|b| b.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
         ["gh"] => gh::matching_commands(prefix)
             .into_iter()
             .map(String::from)
@@ -142,7 +173,7 @@ fn fallback_last_token_candidates(
             .filter(|s| s.starts_with(prefix))
             .cloned()
             .collect(),
-        ["cd"] => fs_dir_candidates(cwd, prefix),
+        ["cd"] => fs_path_candidates(cwd, prefix, true),
         _ => Vec::new(),
     }
 }
@@ -151,12 +182,14 @@ fn fallback_last_token_candidates(
 /// wins when it has a match; git/gh/pnpm fallback only kicks in on a
 /// history miss. Factored out of `EfaHinter::handle` so it's testable
 /// without a real `Db` or filesystem.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_inline_hint(
     line: &str,
     history_match: Option<&str>,
     in_git_repo: bool,
     branches: &[String],
     current_branch: Option<&str>,
+    remotes: &[String],
     package_scripts: &[String],
     cwd: &Path,
 ) -> Option<String> {
@@ -174,6 +207,7 @@ pub fn resolve_inline_hint(
         in_git_repo,
         branches,
         current_branch,
+        remotes,
         package_scripts,
         cwd,
     );
@@ -235,6 +269,11 @@ impl Hinter for EfaHinter {
                 .map(|root| self.branch_cache.branches(root))
                 .unwrap_or_default();
             let current_branch = roots.git_root.as_deref().and_then(git::current_branch);
+            let remotes = roots
+                .git_root
+                .as_deref()
+                .map(git::remotes)
+                .unwrap_or_default();
             let package_scripts = roots
                 .package_root
                 .as_deref()
@@ -247,6 +286,7 @@ impl Hinter for EfaHinter {
                 in_git_repo,
                 &branches,
                 current_branch.as_deref(),
+                &remotes,
                 &package_scripts,
                 &PathBuf::from(cwd),
             )
@@ -309,6 +349,11 @@ impl Completer for EfaCompleter {
             .map(|root| self.branch_cache.branches(root))
             .unwrap_or_default();
         let current_branch = roots.git_root.as_deref().and_then(git::current_branch);
+        let remotes = roots
+            .git_root
+            .as_deref()
+            .map(git::remotes)
+            .unwrap_or_default();
         let package_scripts = roots
             .package_root
             .as_deref()
@@ -339,6 +384,7 @@ impl Completer for EfaCompleter {
             in_git_repo,
             &branches,
             current_branch.as_deref(),
+            &remotes,
             &package_scripts,
             &cwd,
         );
@@ -366,144 +412,231 @@ impl Completer for EfaCompleter {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
+    fn hint(
+        line: &str,
+        history_match: Option<&str>,
+        in_git_repo: bool,
+        branches: &[String],
+        current_branch: Option<&str>,
+        remotes: &[String],
+        package_scripts: &[String],
+        cwd: &Path,
+    ) -> Option<String> {
+        resolve_inline_hint(
+            line,
+            history_match,
+            in_git_repo,
+            branches,
+            current_branch,
+            remotes,
+            package_scripts,
+            cwd,
+        )
+    }
+
+    fn nowhere() -> &'static Path {
+        Path::new("/nonexistent")
+    }
+
     #[test]
     fn history_wins_over_git_fallback() {
         let branches = vec!["main".to_string()];
-        let hint = resolve_inline_hint(
+        let h = hint(
             "git ch",
             Some("git checkout-history"),
             true,
             &branches,
             None,
             &[],
-            Path::new("/nonexistent"),
+            &[],
+            nowhere(),
         );
-        assert_eq!(hint, Some("eckout-history".to_string()));
+        assert_eq!(h, Some("eckout-history".to_string()));
     }
 
     #[test]
     fn git_fallback_activates_only_on_history_miss() {
-        let hint = resolve_inline_hint(
-            "git chec",
-            None,
-            true,
-            &[],
-            None,
-            &[],
-            Path::new("/nonexistent"),
-        );
-        assert_eq!(hint, Some("kout".to_string()));
+        let h = hint("git chec", None, true, &[], None, &[], &[], nowhere());
+        assert_eq!(h, Some("kout".to_string()));
     }
 
     #[test]
     fn git_branch_fallback_requires_git_repo() {
         let branches = vec!["main".to_string(), "feature/foo".to_string()];
-        let hint = resolve_inline_hint(
+        let h = hint(
             "git checkout ma",
             None,
             false,
             &branches,
             None,
             &[],
-            Path::new("/nonexistent"),
+            &[],
+            nowhere(),
         );
-        assert_eq!(hint, None);
+        assert_eq!(h, None);
 
-        let hint = resolve_inline_hint(
+        let h = hint(
             "git checkout ma",
             None,
             true,
             &branches,
             None,
             &[],
-            Path::new("/nonexistent"),
+            &[],
+            nowhere(),
         );
-        assert_eq!(hint, Some("in".to_string()));
+        assert_eq!(h, Some("in".to_string()));
+    }
+
+    #[test]
+    fn git_ref_taking_subcommands_include_current_branch() {
+        let branches = vec!["main".to_string(), "master".to_string()];
+        // Unlike checkout/switch, `log`/`diff`/`show` don't exclude the
+        // branch you're already on.
+        let h = hint(
+            "git log ma",
+            None,
+            true,
+            &branches,
+            Some("main"),
+            &[],
+            &[],
+            nowhere(),
+        );
+        assert_eq!(h, Some("in".to_string()));
+    }
+
+    #[test]
+    fn git_ref_taking_subcommands_require_git_repo() {
+        let branches = vec!["main".to_string()];
+        let h = hint(
+            "git show ma",
+            None,
+            false,
+            &branches,
+            None,
+            &[],
+            &[],
+            nowhere(),
+        );
+        assert_eq!(h, None);
+    }
+
+    #[test]
+    fn git_remote_taking_subcommands_offer_remote_first() {
+        let remotes = vec!["origin".to_string(), "upstream".to_string()];
+        let h = hint(
+            "git push or",
+            None,
+            true,
+            &[],
+            None,
+            &remotes,
+            &[],
+            nowhere(),
+        );
+        assert_eq!(h, Some("igin".to_string()));
+    }
+
+    #[test]
+    fn git_remote_taking_subcommands_offer_branch_after_remote() {
+        let branches = vec!["main".to_string(), "feature/foo".to_string()];
+        let h = hint(
+            "git push origin ma",
+            None,
+            true,
+            &branches,
+            None,
+            &[],
+            &[],
+            nowhere(),
+        );
+        assert_eq!(h, Some("in".to_string()));
+    }
+
+    #[test]
+    fn git_path_taking_subcommands_work_outside_git_repo_flag() {
+        // `git add`/`restore`/`rm`/`mv` complete filesystem paths; this
+        // doesn't depend on `in_git_repo` since it's plain fs listing.
+        let root = tempdir();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("staged.rs"), "").unwrap();
+
+        assert_eq!(
+            hint("git add sta", None, false, &[], None, &[], &[], &root),
+            Some("ged.rs".to_string())
+        );
+        assert_eq!(
+            hint("git rm sr", None, true, &[], None, &[], &[], &root),
+            Some("c/".to_string())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn gh_fallback() {
-        let hint = resolve_inline_hint(
-            "gh p",
-            None,
-            false,
-            &[],
-            None,
-            &[],
-            Path::new("/nonexistent"),
-        );
-        assert_eq!(hint, Some("r".to_string()));
+        let h = hint("gh p", None, false, &[], None, &[], &[], nowhere());
+        assert_eq!(h, Some("r".to_string()));
 
-        let hint = resolve_inline_hint(
-            "gh pr cre",
-            None,
-            false,
-            &[],
-            None,
-            &[],
-            Path::new("/nonexistent"),
-        );
-        assert_eq!(hint, Some("ate".to_string()));
+        let h = hint("gh pr cre", None, false, &[], None, &[], &[], nowhere());
+        assert_eq!(h, Some("ate".to_string()));
     }
 
     #[test]
     fn pkgmgr_scripts_win_over_subcommands() {
         let scripts = vec!["devserver".to_string()];
         // "dev" only matches the script, not any static pnpm subcommand.
-        let hint = resolve_inline_hint(
-            "pnpm dev",
-            None,
-            false,
-            &[],
-            None,
-            &scripts,
-            Path::new("/nonexistent"),
-        );
-        assert_eq!(hint, Some("server".to_string()));
+        let h = hint("pnpm dev", None, false, &[], None, &[], &scripts, nowhere());
+        assert_eq!(h, Some("server".to_string()));
     }
 
     #[test]
     fn pkgmgr_run_form_only_offers_scripts() {
         let scripts = vec!["build".to_string()];
-        let hint = resolve_inline_hint(
+        let h = hint(
             "pnpm run bui",
             None,
             false,
             &[],
             None,
+            &[],
             &scripts,
-            Path::new("/nonexistent"),
+            nowhere(),
         );
-        assert_eq!(hint, Some("ld".to_string()));
+        assert_eq!(h, Some("ld".to_string()));
     }
 
     #[test]
     fn current_branch_excluded_from_checkout_candidates() {
         let branches = vec!["main".to_string(), "master".to_string()];
-        let hint = resolve_inline_hint(
+        let h = hint(
             "git checkout ma",
             None,
             true,
             &branches,
             Some("main"),
             &[],
-            Path::new("/nonexistent"),
+            &[],
+            nowhere(),
         );
-        assert_eq!(hint, Some("ster".to_string()));
+        assert_eq!(h, Some("ster".to_string()));
     }
 
     #[test]
     fn no_fallback_when_nothing_matches() {
-        let hint = resolve_inline_hint(
+        let h = hint(
             "echo hel",
             None,
             true,
             &["main".to_string()],
             None,
             &[],
-            Path::new("/nonexistent"),
+            &[],
+            nowhere(),
         );
-        assert_eq!(hint, None);
+        assert_eq!(h, None);
     }
 
     #[test]
@@ -534,10 +667,10 @@ mod tests {
         std::fs::create_dir_all(root.join("vaeother")).unwrap();
         std::fs::write(root.join("vaefile.txt"), "").unwrap();
 
-        let hint = resolve_inline_hint("cd vae", None, false, &[], None, &[], &root);
+        let h = hint("cd vae", None, false, &[], None, &[], &[], &root);
         // Both "vaeproject/" and "vaeother/" match; alphabetical sort picks
         // "vaeother/" first, and files are never offered for `cd`.
-        assert_eq!(hint, Some("other/".to_string()));
+        assert_eq!(h, Some("other/".to_string()));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -547,8 +680,8 @@ mod tests {
         let root = tempdir();
         std::fs::create_dir_all(root.join("sub/deep")).unwrap();
 
-        let hint = resolve_inline_hint("cd sub/de", None, false, &[], None, &[], &root);
-        assert_eq!(hint, Some("ep/".to_string()));
+        let h = hint("cd sub/de", None, false, &[], None, &[], &[], &root);
+        assert_eq!(h, Some("ep/".to_string()));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -560,11 +693,11 @@ mod tests {
         std::fs::create_dir_all(root.join("visible")).unwrap();
 
         assert_eq!(
-            resolve_inline_hint("cd ", None, false, &[], None, &[], &root),
+            hint("cd ", None, false, &[], None, &[], &[], &root),
             Some("visible/".to_string())
         );
         assert_eq!(
-            resolve_inline_hint("cd .", None, false, &[], None, &[], &root),
+            hint("cd .", None, false, &[], None, &[], &[], &root),
             Some("hidden/".to_string())
         );
 
@@ -574,8 +707,8 @@ mod tests {
     #[test]
     fn cd_no_match_returns_none() {
         let root = tempdir();
-        let hint = resolve_inline_hint("cd zzz", None, false, &[], None, &[], &root);
-        assert_eq!(hint, None);
+        let h = hint("cd zzz", None, false, &[], None, &[], &[], &root);
+        assert_eq!(h, None);
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -37,8 +37,14 @@ Core feature: **remember commands per directory and suggest them when you
 start typing.**
 
 On top of that (v0.2):
-- Git subcommand and local-branch completion (read straight from `.git`,
-  no `git` subprocess).
+- Git subcommand completion, plus per-subcommand argument completion (all
+  read straight from `.git`, no `git` subprocess):
+  - `checkout`/`switch`/`merge`/`rebase` - local branch names (current
+    branch excluded).
+  - `diff`/`log`/`show` - local branch names (current branch included).
+  - `add`/`restore`/`rm`/`mv` - filesystem paths.
+  - `push`/`pull`/`fetch` - remote names, then branch names once a remote
+    is typed.
 - `gh` command/subcommand completion (static table, no network calls, no
   auth).
 - pnpm/npm/yarn subcommand and `package.json` script completion (from the
@@ -139,8 +145,12 @@ directory-aware suggestions and ranking.
   (no `cd -`, no `CDPATH`, etc.).
 - `gh` completion is a static command/subcommand table only — no live
   data (no open PRs, no issue titles, no repo-specific info).
-- Filesystem-path completion covers `cd` only; other commands taking a
-  file/directory argument (`cat`, `code`, `rm`, ...) don't get it yet.
+- Filesystem-path completion covers `cd` and `git add/restore/rm/mv` only;
+  other commands taking a file/directory argument (`cat`, `code`, plain
+  `rm`, ...) don't get it yet.
+- `git push`/`pull`/`fetch` remote completion reads `refs/remotes/` and
+  `packed-refs` only, not `.git/config` - a remote with no fetched refs
+  yet won't show up until you've fetched from it at least once.
 - No AI-based suggestions yet.
 - No Homebrew formula; install by copying/symlinking the binary.
 

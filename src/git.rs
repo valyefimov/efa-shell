@@ -44,8 +44,20 @@ pub const SUBCOMMANDS: &[&str] = &[
     "worktree",
 ];
 
-/// Git subcommands that take a branch/ref name as their next argument.
+/// Git subcommands that take a branch/ref name as their next argument,
+/// where the branch you're already on isn't a useful target.
 pub const BRANCH_TAKING_SUBCOMMANDS: &[&str] = &["checkout", "switch", "merge", "rebase"];
+
+/// Git subcommands that take a branch/ref name as their next argument,
+/// where the current branch remains a perfectly sensible target.
+pub const REF_TAKING_SUBCOMMANDS: &[&str] = &["diff", "log", "show"];
+
+/// Git subcommands that take a file/directory path as their next argument.
+pub const PATH_TAKING_SUBCOMMANDS: &[&str] = &["add", "restore", "rm", "mv"];
+
+/// Git subcommands that take a remote name as their next argument, and
+/// optionally a branch name as the argument after that.
+pub const REMOTE_TAKING_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch"];
 
 pub fn matching_subcommands(prefix: &str) -> Vec<&'static str> {
     SUBCOMMANDS
@@ -142,6 +154,44 @@ pub fn local_branches(repo_root: &Path) -> Vec<String> {
     branches.sort();
     branches.dedup();
     branches
+}
+
+/// All remote names (e.g. `origin`), read from `refs/remotes/<name>/...`
+/// directories plus any packed `refs/remotes/<name>/...` entries.
+pub fn remotes(repo_root: &Path) -> Vec<String> {
+    let Some(source) = resolve_ref_source(repo_root) else {
+        return Vec::new();
+    };
+
+    let mut remotes = Vec::new();
+    let remotes_dir = source.common_dir.join("refs/remotes");
+    if let Ok(entries) = fs::read_dir(&remotes_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                remotes.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let packed = source.common_dir.join("packed-refs");
+    if let Ok(contents) = fs::read_to_string(&packed) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((_sha, refname)) = line.split_once(' ')
+                && let Some(rest) = refname.strip_prefix("refs/remotes/")
+                && let Some((name, _branch)) = rest.split_once('/')
+            {
+                remotes.push(name.to_string());
+            }
+        }
+    }
+
+    remotes.sort();
+    remotes.dedup();
+    remotes
 }
 
 /// Recurse `dir` (relative to `heads_root`) collecting loose ref file paths
@@ -323,6 +373,43 @@ mod tests {
     fn subcommand_prefix_matching() {
         assert!(matching_subcommands("chec").contains(&"checkout"));
         assert!(matching_subcommands("zzz").is_empty());
+    }
+
+    #[test]
+    fn remotes_from_loose_dir() {
+        let root = tempdir();
+        init_bare_git_layout(&root);
+        fs::create_dir_all(root.join(".git/refs/remotes/origin")).unwrap();
+        fs::write(root.join(".git/refs/remotes/origin/main"), "sha").unwrap();
+
+        assert_eq!(remotes(&root), vec!["origin".to_string()]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remotes_from_packed_refs_dedup_with_loose() {
+        let root = tempdir();
+        init_bare_git_layout(&root);
+        fs::create_dir_all(root.join(".git/refs/remotes/origin")).unwrap();
+        fs::write(root.join(".git/refs/remotes/origin/main"), "sha").unwrap();
+        fs::write(
+            root.join(".git/packed-refs"),
+            "abc123 refs/remotes/origin/main\ndef456 refs/remotes/upstream/main\n",
+        )
+        .unwrap();
+
+        let mut found = remotes(&root);
+        found.sort();
+        assert_eq!(found, vec!["origin".to_string(), "upstream".to_string()]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remotes_missing_returns_empty() {
+        let root = tempdir();
+        init_bare_git_layout(&root);
+        assert_eq!(remotes(&root), Vec::<String>::new());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
