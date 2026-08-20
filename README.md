@@ -17,15 +17,38 @@ efa shows an inline autosuggestion for `pnpm dev`, with the already-typed
 `pn` rendered normally and the remaining `pm dev` dimmed. Press `Tab` or
 `Right Arrow` (at the end of the line) to accept it, then `Enter` to run it.
 
-## v0.1 scope
+efa also knows about git, `gh`, and pnpm/npm/yarn even when you haven't run
+a matching command before. If there's no inline hint to accept, `Tab` opens
+a fish-style completion menu instead - cycle forward with `Tab`, backward
+with `Shift+Tab`:
 
-The only feature in this version is: **remember commands per directory and
-suggest them when you start typing.**
+```
+~/projects/payslick ❯ git checkout <Tab>
+feature/foo  main  release-1.0
+```
 
-Explicitly out of scope for now: AI/LLM suggestions, GitHub integration,
-git-aware or filesystem-aware completion, project-root detection, plugins,
-cloud sync, accounts, telemetry, and a config UI. See "Development roadmap"
-below for what might come later.
+History always wins: if you've actually run a matching command in the
+current directory before, that suggestion takes priority over generic
+git/gh/package-manager knowledge.
+
+## Scope
+
+Core feature: **remember commands per directory and suggest them when you
+start typing.**
+
+On top of that (v0.2):
+- Git subcommand and local-branch completion (read straight from `.git`,
+  no `git` subprocess).
+- `gh` command/subcommand completion (static table, no network calls, no
+  auth).
+- pnpm/npm/yarn subcommand and `package.json` script completion (from the
+  nearest `package.json`, project-root-aware).
+- A real fish-style Tab-cycled completion menu, in addition to the single
+  dimmed inline hint.
+
+Still explicitly out of scope: AI/LLM suggestions, `gh` network calls,
+plugins, cloud sync, accounts, telemetry, and a config UI. See
+"Development roadmap" below for what might come later.
 
 ## Requirements
 
@@ -96,24 +119,27 @@ directory-aware suggestions and ranking.
 
 ## Current limitations
 
-- Suggestions only match the exact current directory (`cwd`), not a
-  project root — running the same command from a subdirectory of a project
-  won't yet surface history from the parent directory.
+- History suggestions still only match the exact current directory
+  (`cwd`), not a project root — running the same command from a
+  subdirectory of a project won't yet surface history from the parent
+  directory. (`project_root` is now recorded on every command, but
+  history ranking doesn't use it yet.)
 - The `cd` builtin handles the common forms (`cd`, `cd ~`, `cd ..`, `cd
   ./foo`, `cd /abs/path`) but is not a full zsh-compatible implementation
   (no `cd -`, no `CDPATH`, etc.).
-- No AI-based, git-aware, or filesystem-aware suggestions yet — only exact
-  history prefix matches.
+- `gh` completion is a static command/subcommand table only — no live
+  data (no open PRs, no issue titles, no repo-specific info).
+- No AI-based or general filesystem-path completion yet.
 - No Homebrew formula; install by copying/symlinking the binary.
 
 ## Development roadmap
 
-Planned, but intentionally deferred past v0.1:
+Planned, but intentionally deferred:
 
-- Project-root-aware suggestions (distinct from raw `cwd`).
-- Additional completion providers beyond history (filesystem, git,
-  project-specific commands).
+- Project-root-aware history ranking (use the now-recorded `project_root`
+  column, not just raw `cwd`).
+- Filesystem-path completion.
 - AI-assisted suggestions.
-- GitHub integration.
+- Live `gh`/GitHub data (not just static commands).
 - Plugin system.
 - Homebrew packaging.
